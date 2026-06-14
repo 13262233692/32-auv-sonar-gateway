@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"auv-sonar-gateway/internal/model"
+	"auv-sonar-gateway/internal/voidfill"
 )
 
 type FrameHeap []*model.PointCloudFrame
@@ -27,28 +28,57 @@ func (h *FrameHeap) Pop() interface{} {
 	return item
 }
 
+type VoidFillCallback func(frames []*model.PointCloudFrame) ([]model.Point3D, []voidfill.PatchFillResult, error)
+
 type Reorganizer struct {
-	maxCacheFrames int
-	frameHeap      FrameHeap
-	cache          map[uint16]*model.PointCloudFrame
-	mu             sync.Mutex
-	onReadyFrames  func([]*model.PointCloudFrame)
-	frameOrder     []uint16
-	maxOrder       int
+	maxCacheFrames    int
+	frameHeap         FrameHeap
+	cache             map[uint16]*model.PointCloudFrame
+	mu                sync.Mutex
+	onReadyFrames     func([]*model.PointCloudFrame)
+	frameOrder        []uint16
+	maxOrder          int
+
+	voidFiller        *voidfill.VoidFiller
+	onVoidFill        VoidFillCallback
+	fillEveryNFrames  int
+	framesSinceFill   int
+	autoFillEnabled   bool
+	filledPoints      []model.Point3D
+	fillResults       []voidfill.PatchFillResult
+	fillMu            sync.Mutex
 }
 
 func NewReorganizer(maxCacheFrames int) *Reorganizer {
 	r := &Reorganizer{
-		maxCacheFrames: maxCacheFrames,
-		cache:          make(map[uint16]*model.PointCloudFrame),
-		frameOrder:     make([]uint16, 0, maxCacheFrames),
+		maxCacheFrames:   maxCacheFrames,
+		cache:            make(map[uint16]*model.PointCloudFrame),
+		frameOrder:       make([]uint16, 0, maxCacheFrames),
+		fillEveryNFrames: 16,
 	}
 	heap.Init(&r.frameHeap)
 	return r
 }
 
+func (r *Reorganizer) EnableVoidFill(filler *voidfill.VoidFiller, everyNFrames int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.voidFiller = filler
+	r.autoFillEnabled = filler != nil
+	if everyNFrames > 0 {
+		r.fillEveryNFrames = everyNFrames
+	}
+	r.onVoidFill = func(frames []*model.PointCloudFrame) ([]model.Point3D, []voidfill.PatchFillResult, error) {
+		return r.voidFiller.FillFrames(frames)
+	}
+}
+
 func (r *Reorganizer) SetReadyHandler(handler func([]*model.PointCloudFrame)) {
 	r.onReadyFrames = handler
+}
+
+func (r *Reorganizer) SetVoidFillCallback(cb VoidFillCallback) {
+	r.onVoidFill = cb
 }
 
 func (r *Reorganizer) SubmitFrame(frame *model.PointCloudFrame) {
@@ -66,6 +96,98 @@ func (r *Reorganizer) SubmitFrame(frame *model.PointCloudFrame) {
 	for len(r.cache) > r.maxCacheFrames {
 		r.evictOldestLocked()
 	}
+
+	if r.autoFillEnabled && r.onVoidFill != nil {
+		r.framesSinceFill++
+		if r.framesSinceFill >= r.fillEveryNFrames {
+			r.framesSinceFill = 0
+			r.triggerFillLocked()
+		}
+	}
+}
+
+func (r *Reorganizer) triggerFillLocked() {
+	if !r.autoFillEnabled || r.onVoidFill == nil {
+		return
+	}
+
+	frames := make([]*model.PointCloudFrame, 0, len(r.cache))
+	tmpHeap := make(FrameHeap, len(r.frameHeap))
+	copy(tmpHeap, r.frameHeap)
+
+	for tmpHeap.Len() > 0 {
+		frames = append(frames, heap.Pop(&tmpHeap).(*model.PointCloudFrame))
+	}
+
+	if len(frames) < 2 {
+		return
+	}
+
+	go func() {
+		filled, results, err := r.onVoidFill(frames)
+		if err != nil {
+			return
+		}
+		r.fillMu.Lock()
+		r.filledPoints = filled
+		r.fillResults = results
+		r.fillMu.Unlock()
+
+		if r.onReadyFrames != nil {
+			filledFrame := &model.PointCloudFrame{
+				TimestampUS: frames[len(frames)-1].TimestampUS,
+				PingCounter: frames[len(frames)-1].PingCounter,
+				Points:      filled,
+				NumPoints:   len(filled),
+			}
+			r.onReadyFrames([]*model.PointCloudFrame{filledFrame})
+		}
+	}()
+}
+
+func (r *Reorganizer) GetFilledPoints() []model.Point3D {
+	r.fillMu.Lock()
+	defer r.fillMu.Unlock()
+	return r.filledPoints
+}
+
+func (r *Reorganizer) GetFillResults() []voidfill.PatchFillResult {
+	r.fillMu.Lock()
+	defer r.fillMu.Unlock()
+	return r.fillResults
+}
+
+func (r *Reorganizer) ForceFill() ([]model.Point3D, []voidfill.PatchFillResult, error) {
+	r.mu.Lock()
+	if !r.autoFillEnabled || r.onVoidFill == nil {
+		r.mu.Unlock()
+		return nil, nil, nil
+	}
+
+	frames := make([]*model.PointCloudFrame, 0, len(r.cache))
+	tmpHeap := make(FrameHeap, len(r.frameHeap))
+	copy(tmpHeap, r.frameHeap)
+
+	for tmpHeap.Len() > 0 {
+		frames = append(frames, heap.Pop(&tmpHeap).(*model.PointCloudFrame))
+	}
+	r.mu.Unlock()
+
+	if len(frames) == 0 {
+		return nil, nil, nil
+	}
+
+	filled, results, err := r.onVoidFill(frames)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	r.fillMu.Lock()
+	r.filledPoints = filled
+	r.fillResults = results
+	r.fillMu.Unlock()
+
+	return filled, results, nil
 }
 
 func (r *Reorganizer) evictOldestLocked() {
@@ -121,6 +243,24 @@ func (r *Reorganizer) Flush() []*model.PointCloudFrame {
 	r.frameHeap = r.frameHeap[:0]
 	r.frameOrder = r.frameOrder[:0]
 	heap.Init(&r.frameHeap)
+
+	if r.autoFillEnabled && r.onVoidFill != nil && len(result) >= 2 {
+		filled, results, err := r.onVoidFill(result)
+		if err == nil && len(filled) > 0 {
+			filledFrame := &model.PointCloudFrame{
+				TimestampUS: result[len(result)-1].TimestampUS,
+				PingCounter: result[len(result)-1].PingCounter,
+				Points:      filled,
+				NumPoints:   len(filled),
+			}
+			result = append(result, filledFrame)
+
+			r.fillMu.Lock()
+			r.filledPoints = filled
+			r.fillResults = results
+			r.fillMu.Unlock()
+		}
+	}
 
 	if r.onReadyFrames != nil && len(result) > 0 {
 		r.onReadyFrames(result)

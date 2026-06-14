@@ -9,22 +9,23 @@ import (
 	"time"
 
 	"auv-sonar-gateway/internal/beam"
-	"auv-sonar-gateway/internal/framing"
 	"auv-sonar-gateway/internal/ins"
 	redisx "auv-sonar-gateway/internal/redis"
 	"auv-sonar-gateway/internal/model"
 	"auv-sonar-gateway/internal/multicast"
 	"auv-sonar-gateway/internal/pointcloud"
 	"auv-sonar-gateway/internal/tcp"
+	"auv-sonar-gateway/internal/voidfill"
+	"auv-sonar-gateway/internal/kriging"
 )
 
 type GatewayConfig struct {
 	SonarIface     string
-	SonarGroup       string
-	SonarUdpPort    int
-	SonarTcpPort    int
-	SonarBuffer      int
-	SonarEnableTcp    bool
+	SonarGroup     string
+	SonarUdpPort   int
+	SonarTcpPort   int
+	SonarBuffer    int
+	SonarEnableTcp bool
 
 	INSAddr        string
 	INSPort        int
@@ -35,19 +36,31 @@ type GatewayConfig struct {
 
 	MaxCacheFrames int
 	SSPProfile     *model.SoundSpeedProfile
-	DebugLogging     bool
+	DebugLogging   bool
 	MetricsInterval time.Duration
+
+	VoidFillEnable       bool
+	VoidFillCellSize     float64
+	VoidFillEveryNFrames int
+	VoidFillSearchRadius int
+	VoidFillVariogramNugget    float64
+	VoidFillVariogramSill      float64
+	VoidFillVariogramRange     float64
+	VoidFillAnisoAngle         float64
+	VoidFillAnisoRatio         float64
+	VoidFillMaxInterpolateTick int
 }
 
 type Gateway struct {
-	config     GatewayConfig
-	sonarRx    *multicast.SonarReceiver
-	sonarTcp   *tcp.SonarTCPServer
-	insReader  *ins.INSReader
-	beamProc   *beam.Processor
-	reorganizer *pointcloud.Reorganizer
-	redisHub   *redisx.Hub
-	metricsDone chan struct{}
+	config       GatewayConfig
+	sonarRx      *multicast.SonarReceiver
+	sonarTcp     *tcp.SonarTCPServer
+	insReader    *ins.INSReader
+	beamProc     *beam.Processor
+	reorganizer  *pointcloud.Reorganizer
+	redisHub     *redisx.Hub
+	voidFiller   *voidfill.VoidFiller
+	metricsDone  chan struct{}
 }
 
 func NewGateway(cfg GatewayConfig) *Gateway {
@@ -96,6 +109,36 @@ func (g *Gateway) Init() error {
 			}
 		}
 	})
+
+	if g.config.VoidFillEnable {
+		fillerCfg := voidfill.DefaultFillerConfig()
+		if g.config.VoidFillCellSize > 0 {
+			fillerCfg.CellSize = g.config.VoidFillCellSize
+		}
+		if g.config.VoidFillSearchRadius > 0 {
+			fillerCfg.SearchRadius = g.config.VoidFillSearchRadius
+		}
+		if g.config.VoidFillVariogramNugget > 0 {
+			fillerCfg.VariogramNugget = g.config.VoidFillVariogramNugget
+		}
+		if g.config.VoidFillVariogramSill > 0 {
+			fillerCfg.VariogramSill = g.config.VoidFillVariogramSill
+		}
+		if g.config.VoidFillVariogramRange > 0 {
+			fillerCfg.VariogramRange = g.config.VoidFillVariogramRange
+		}
+		fillerCfg.VariogramAnisoAngle = g.config.VoidFillAnisoAngle
+		fillerCfg.VariogramAnisoRatio = g.config.VoidFillAnisoRatio
+		if g.config.VoidFillMaxInterpolateTick > 0 {
+			fillerCfg.MaxInterpolatePerTick = g.config.VoidFillMaxInterpolateTick
+		}
+
+		g.voidFiller = voidfill.NewVoidFiller(fillerCfg)
+		g.reorganizer.EnableVoidFill(g.voidFiller, g.config.VoidFillEveryNFrames)
+
+		log.Printf("void fill enabled: cell=%.2fm, radius=%d, range=%.2fm, every=%d frames",
+			fillerCfg.CellSize, fillerCfg.SearchRadius, fillerCfg.VariogramRange, g.config.VoidFillEveryNFrames)
+	}
 
 	g.beamProc.SetFrameHandler(func(frame *model.PointCloudFrame) {
 		g.reorganizer.SubmitFrame(frame)
@@ -183,6 +226,11 @@ func (g *Gateway) Start() error {
 	log.Printf("  Redis: %s (DB=%d)", g.config.RedisAddr, g.config.RedisDB)
 	log.Printf("  Frame cache: %d frames", g.config.MaxCacheFrames)
 	log.Printf("  Sliding window: ENABLED (state machine driven)")
+	if g.config.VoidFillEnable {
+		log.Printf("  Void fill: ENABLED (Kriging, cell=%.2fm)", g.config.VoidFillCellSize)
+	} else {
+		log.Printf("  Void fill: DISABLED")
+	}
 	log.Printf("  Debug logging: %v", g.config.DebugLogging)
 	log.Printf("  Metrics interval: %v", g.config.MetricsInterval)
 	log.Printf("=================================")
@@ -261,6 +309,25 @@ func (g *Gateway) logCurrentStats() {
 		redisStats.FramesPublished, redisStats.PointsPublished,
 		redisStats.SSPUpdates, redisStats.InspDataUpdates)
 	log.Printf("  PointCloud: cache=%d frames", g.reorganizer.Size())
+
+	if g.voidFiller != nil {
+		vs := g.voidFiller.GetStats()
+		log.Printf("  Void Fill: grids=%d, void_detected=%d, filled=%d, skipped=%d, kriging=%d, idw=%d",
+			vs.GridsProcessed, vs.VoidCellsDetected, vs.VoidCellsFilled, vs.VoidCellsSkipped,
+			vs.KrigingInterpolations, vs.IDWFallbacks)
+		if vs.KrigingInterpolations+vs.IDWFallbacks > 0 {
+			log.Printf("  Void Fill Perf: avg=%.1fus, min=%.1fus, max=%.1fus",
+				vs.AvgInterpolateUs, vs.MinInterpolateUs, vs.MaxInterpolateUs)
+		}
+
+		fillResults := g.reorganizer.GetFillResults()
+		if len(fillResults) > 0 {
+			last := fillResults[len(fillResults)-1]
+			log.Printf("  Last Patch: id=%d, voids=%d, filled=%d, kriging=%d, idw=%d, elapsed=%dus",
+				last.PatchID, last.VoidCellsInPatch, last.FilledCells,
+				last.KrigingCount, last.IDWCount, last.ElapsedUs)
+		}
+	}
 	log.Printf("---------------------")
 }
 
@@ -324,7 +391,48 @@ func (g *Gateway) printFinalStats() {
 	log.Printf("  SSP updates:    %d", redisStats.SSPUpdates)
 	log.Printf("  INS updates:    %d", redisStats.InspDataUpdates)
 
+	if g.voidFiller != nil {
+		vs := g.voidFiller.GetStats()
+		log.Printf("Void Fill (Kriging):")
+		log.Printf("  Grids processed:   %d", vs.GridsProcessed)
+		log.Printf("  Void cells detected: %d", vs.VoidCellsDetected)
+		log.Printf("  Void cells filled: %d", vs.VoidCellsFilled)
+		log.Printf("  Void cells skipped: %d", vs.VoidCellsSkipped)
+		log.Printf("  Kriging interpolations: %d", vs.KrigingInterpolations)
+		log.Printf("  IDW fallbacks:      %d", vs.IDWFallbacks)
+		if vs.KrigingInterpolations+vs.IDWFallbacks > 0 {
+			log.Printf("  Interpolation Perf:")
+			log.Printf("    Avg: %.1f us", vs.AvgInterpolateUs)
+			log.Printf("    Min: %.1f us", vs.MinInterpolateUs)
+			log.Printf("    Max: %.1f us", vs.MaxInterpolateUs)
+		}
+
+		vg := g.voidFiller.GetVariogram()
+		log.Printf("  Variogram:")
+		log.Printf("    Model: %s", modelName(vg.Model))
+		log.Printf("    Nugget: %.4f", vg.Nugget)
+		log.Printf("    Sill:   %.4f", vg.Sill)
+		log.Printf("    Range:  %.2f m", vg.Range)
+		if vg.AnisoRatio != 1.0 {
+			log.Printf("    Aniso:  ratio=%.2f angle=%.1fdeg",
+				vg.AnisoRatio, vg.AnisoAngle*kriging.RadToDeg)
+		}
+	}
+
 	log.Printf("==========================")
+}
+
+func modelName(m kriging.VariogramModel) string {
+	switch m {
+	case kriging.ModelSpherical:
+		return "Spherical"
+	case kriging.ModelExponential:
+		return "Exponential"
+	case kriging.ModelGaussian:
+		return "Gaussian"
+	default:
+		return "Unknown"
+	}
 }
 
 func buildDefaultSSP() *model.SoundSpeedProfile {
@@ -354,8 +462,8 @@ func main() {
 	cfg := GatewayConfig{
 		SonarIface:     "eth0",
 		SonarGroup:     "239.100.1.1",
-		SonarUdpPort:    56789,
-		SonarTcpPort:    56791,
+		SonarUdpPort:   56789,
+		SonarTcpPort:   56791,
 		SonarBuffer:    32 * 1024 * 1024,
 		SonarEnableTcp: true,
 
@@ -369,6 +477,17 @@ func main() {
 		MaxCacheFrames: 128,
 		DebugLogging:   false,
 		MetricsInterval: 5 * time.Second,
+
+		VoidFillEnable:       true,
+		VoidFillCellSize:     0.5,
+		VoidFillEveryNFrames: 16,
+		VoidFillSearchRadius: 4,
+		VoidFillVariogramNugget:    0.01,
+		VoidFillVariogramSill:      1.0,
+		VoidFillVariogramRange:     50.0,
+		VoidFillAnisoAngle:         0.0,
+		VoidFillAnisoRatio:         1.0,
+		VoidFillMaxInterpolateTick: 256,
 	}
 
 	gw := NewGateway(cfg)
