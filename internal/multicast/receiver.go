@@ -7,20 +7,24 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"auv-sonar-gateway/internal/framing"
 	"auv-sonar-gateway/internal/model"
 	"auv-sonar-gateway/internal/uper"
 )
 
 type SonarReceiver struct {
-	iface      *net.Interface
-	groupAddr  *net.UDPAddr
-	conn       *net.UDPConn
-	onPing     func(*model.SonarPing)
-	running    atomic.Bool
-	wg         sync.WaitGroup
-	bufferSize int
-	stats      ReceiverStats
-	mu         sync.Mutex
+	iface       *net.Interface
+	groupAddr   *net.UDPAddr
+	conn        *net.UDPConn
+	onPing      func(*model.SonarPing)
+	running     atomic.Bool
+	wg          sync.WaitGroup
+	bufferSize  int
+	stats       ReceiverStats
+	mu          sync.Mutex
+	assembler   *framing.SafeFrameProcessor
+	useSlidingWindow bool
+	debugLog    bool
 }
 
 type ReceiverStats struct {
@@ -28,6 +32,7 @@ type ReceiverStats struct {
 	PacketsDropped  uint64
 	DecodeErrors    uint64
 	BytesReceived   uint64
+	AssemblerStats  framing.AssemblerStats
 }
 
 func NewSonarReceiver(ifaceName, multicastGroup string, port int, bufferSize int) (*SonarReceiver, error) {
@@ -41,15 +46,36 @@ func NewSonarReceiver(ifaceName, multicastGroup string, port int, bufferSize int
 		return nil, fmt.Errorf("resolve multicast address: %w", err)
 	}
 
-	return &SonarReceiver{
-		iface:      iface,
-		groupAddr:  addr,
-		bufferSize: bufferSize,
-	}, nil
+	r := &SonarReceiver{
+		iface:       iface,
+		groupAddr:   addr,
+		bufferSize:  bufferSize,
+		useSlidingWindow: true,
+	}
+
+	r.assembler = framing.NewSafeSonarProcessor(uper.DecodeRawPacket, framing.MaxFrameSize)
+
+	return r, nil
 }
 
 func (r *SonarReceiver) SetPingHandler(handler func(*model.SonarPing)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.onPing = handler
+	if r.assembler != nil {
+		r.assembler.SetPingHandler(handler)
+	}
+}
+
+func (r *SonarReceiver) SetSlidingWindow(enabled bool) {
+	r.useSlidingWindow = enabled
+}
+
+func (r *SonarReceiver) SetDebug(enabled bool) {
+	r.debugLog = enabled
+	if r.assembler != nil {
+		r.assembler.SetDebug(enabled)
+	}
 }
 
 func (r *SonarReceiver) Start() error {
@@ -72,7 +98,8 @@ func (r *SonarReceiver) Start() error {
 	r.wg.Add(1)
 	go r.receiveLoop()
 
-	log.Printf("sonar multicast receiver started on %s (interface: %s)", r.groupAddr, r.iface.Name)
+	log.Printf("sonar multicast receiver started on %s (interface: %s, sliding_window=%v)",
+		r.groupAddr, r.iface.Name, r.useSlidingWindow)
 	return nil
 }
 
@@ -90,7 +117,11 @@ func (r *SonarReceiver) Stop() {
 func (r *SonarReceiver) GetStats() ReceiverStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.stats
+	stats := r.stats
+	if r.assembler != nil {
+		stats.AssemblerStats = r.assembler.Stats()
+	}
+	return stats
 }
 
 func (r *SonarReceiver) receiveLoop() {
@@ -111,20 +142,33 @@ func (r *SonarReceiver) receiveLoop() {
 		r.stats.BytesReceived += uint64(n)
 		r.mu.Unlock()
 
+		if r.debugLog && n > 0 {
+			log.Printf("[multicast] received %d bytes from %s", n, src)
+		}
+
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		ping, err := uper.DecodeRawPacket(data)
-		if err != nil {
-			r.mu.Lock()
-			r.stats.DecodeErrors++
-			r.mu.Unlock()
-			log.Printf("decode error: %v", err)
-			continue
-		}
+		if r.useSlidingWindow {
+			if err := r.assembler.Feed(data); err != nil {
+				r.mu.Lock()
+				r.stats.DecodeErrors++
+				r.mu.Unlock()
+				log.Printf("sliding window feed error: %v", err)
+			}
+		} else {
+			ping, err := uper.DecodeRawPacket(data)
+			if err != nil {
+				r.mu.Lock()
+				r.stats.DecodeErrors++
+				r.mu.Unlock()
+				log.Printf("decode error: %v", err)
+				continue
+			}
 
-		if r.onPing != nil {
-			r.onPing(ping)
+			if r.onPing != nil {
+				r.onPing(ping)
+			}
 		}
 	}
 }
